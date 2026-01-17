@@ -5,86 +5,93 @@ import glob
 from datetime import datetime
 from joblib import Parallel, delayed
 
-# =================================================================================
-# 战法名称：极度缩量反包战法 (虚拟账本回测完整版)
-# 备注：旨在寻找主力洗盘彻底、缩量到极致后的反转爆发点
-# =================================================================================
+# ==========================================
+# 战法：极度缩量反包 (带虚拟持仓账本回测)
+# 逻辑：寻找放量异动后，缩量回调至极点，今日反包确认的个股
+# ==========================================
 
 STRATEGY_NAME = "backtest_reversal_strategy"
 DATA_DIR = "stock_data"
 NAMES_FILE = "stock_names.csv"
 
-def get_performance(df, idx):
-    """虚拟持仓账本：计算买入后不同周期的真实表现"""
-    perf = {}
-    for label, days in [('7天', 7), ('14天', 14), ('20天', 20), ('60天', 60)]:
-        target = idx + days
-        if target < len(df):
-            change = (df['收盘'].iloc[target] - df['收盘'].iloc[idx]) / df['收盘'].iloc[idx]
-            perf[label] = round(change * 100, 2)
-        else:
-            perf[label] = None
-    return perf
-
 def analyze_stock(file_path, names_dict):
     try:
-        # 1. 高速读取
+        # 加载必要数据
         df = pd.read_csv(file_path, usecols=['日期', '开盘', '收盘', '最高', '最低', '成交量', '涨跌幅', '换手率'])
         if len(df) < 120: return None
         
         code = os.path.basename(file_path).split('.')[0]
         name = names_dict.get(code, "未知")
         
-        # 2. 基础过滤 (上海时区/深沪A股/价格区间)
-        if "ST" in name or code.startswith("30") or not (5.0 <= df['收盘'].iloc[-1] <= 20.0):
+        # 基础过滤
+        last_price = df['收盘'].iloc[-1]
+        if "ST" in name or code.startswith("30") or not (5.0 <= last_price <= 20.0):
             return None
 
-        # 3. 核心指标预计算
+        # 向量化准备
         close = df['收盘'].values
         vol = df['成交量'].values
         high = df['最高'].values
         ma20_vol = df['成交量'].rolling(20).mean().values
         
-        # --- 定义“缩量反包”判定函数 ---
-        def is_hit(i):
+        # 战法判定函数
+        def is_strategy_hit(i):
             if i < 20: return False
-            # 逻辑：今日阳线且收盘盖过昨日最高价
-            c_reversal = (close[i] > high[i-1]) and (close[i] > df['开盘'].iloc[i])
-            # 逻辑：前两天成交量萎缩 (地量)
-            c_shrink = (vol[i-1] < ma20_vol[i] * 0.75) and (vol[i-2] < ma20_vol[i] * 0.75)
-            # 逻辑：10日内有过异动放量 (证明有主力在)
-            c_active = (vol[i-10:i] > ma20_vol[i-10:i] * 1.5).any()
-            return c_reversal and c_shrink and c_active
+            # 1. 前期活跃：10日内有过放量 (量 > 20日均量 1.5倍)
+            active = (vol[i-10:i] > ma20_vol[i-10:i] * 1.5).any()
+            # 2. 极度缩量：前两日成交量 < 20日均量 * 0.75
+            shrink = (vol[i-1] < ma20_vol[i] * 0.75) and (vol[i-2] < ma20_vol[i] * 0.75)
+            # 3. 反包确认：今日收盘 > 昨日最高 且 今日收阳
+            reversal = (close[i] > high[i-1]) and (close[i] > df['开盘'].iloc[i])
+            return active and shrink and reversal
 
-        # 4. 全量回测 (扫描该个股过去2年的所有表现)
-        all_signals = []
-        lookback_limit = max(0, len(df) - 500) # 最近约2年
-        for j in range(lookback_limit, len(df) - 1):
-            if is_hit(j):
-                perf = get_performance(df, j)
-                if perf['20天'] is not None:
-                    all_signals.append(perf['20天'])
+        # --- 建立“虚拟持仓账本” (扫描历史所有信号点) ---
+        history_ledger = []
+        # 扫描过去 500 个交易日
+        start_scan = max(20, len(df) - 500)
+        for j in range(start_scan, len(df) - 1): # -1 是为了排除掉“今天”
+            if is_strategy_hit(j):
+                # 计算模拟持有收益率
+                res = {}
+                for days in [7, 14, 20, 60]:
+                    target = j + days
+                    if target < len(df):
+                        res[f'p{days}'] = (close[target] - close[j]) / close[j]
+                    else:
+                        res[f'p{days}'] = None
+                history_ledger.append(res)
 
-        # 5. 今日信号捕捉
+        # 统计账本战绩
+        hit_count = len(history_ledger)
+        win_rate_20d = 0
+        avg_ret_20d = 0
+        if hit_count > 0:
+            ledger_df = pd.DataFrame(history_ledger)
+            p20_valid = ledger_df['p20'].dropna()
+            if not p20_valid.empty:
+                win_rate_20d = (p20_valid > 0).sum() / len(p20_valid)
+                avg_ret_20d = p20_valid.mean()
+
+        # --- 判断今日是否触发信号 ---
         today_idx = len(df) - 1
-        if is_hit(today_idx):
-            # 统计历史战绩
-            hit_count = len(all_signals)
-            win_rate = np.mean([1 if p > 0 else 0 for p in all_signals]) if hit_count > 0 else 0
-            avg_return = np.mean(all_signals) if hit_count > 0 else 0
+        if is_strategy_hit(today_idx):
+            # 综合强度逻辑
+            strength = "⭐⭐⭐⭐⭐" if win_rate_20d > 0.6 and avg_ret_20d > 0.05 else "⭐⭐⭐"
+            if hit_count == 0: strength = "⭐⭐ (新股或首次触发)"
             
-            # 强度评估
-            strength = "⭐⭐⭐⭐⭐" if win_rate > 0.6 and avg_return > 3 else "⭐⭐⭐"
-            advice = "加仓/重仓" if win_rate > 0.7 else "试错/观察"
-            
+            # 操作建议
+            if win_rate_20d > 0.7: advice = "历史强势基因，重仓买入"
+            elif win_rate_20d > 0.5: advice = "概率占优，分批建仓"
+            else: advice = "历史表现平平，轻仓试错"
+
             return {
                 "日期": df['日期'].iloc[today_idx],
-                "代码": code, "名称": name, "现价": close[today_idx],
-                "涨跌幅": df['涨跌幅'].iloc[today_idx],
-                "换手率": df['换手率'].iloc[today_idx],
-                "战法历史触发数": hit_count,
-                "历史20日胜率": f"{win_rate*100:.1f}%",
-                "历史平均收益": f"{avg_return:.2f}%",
+                "代码": code, "名称": name, "现价": last_price,
+                "涨跌幅": f"{df['涨跌幅'].iloc[today_idx]}%",
+                "换手率": f"{df['换手率'].iloc[today_idx]}%",
+                "虚拟账本触发数": hit_count,
+                "历史20日胜率": f"{win_rate_20d*100:.1f}%",
+                "历史20日均益": f"{avg_ret_20d*100:.2f}%",
                 "买入信号强度": strength,
                 "操作建议": advice
             }
@@ -92,24 +99,30 @@ def analyze_stock(file_path, names_dict):
         return None
 
 def main():
+    if not os.path.exists(NAMES_FILE): return
     names_df = pd.read_csv(NAMES_FILE)
     names_dict = dict(zip(names_df['code'].astype(str).str.zfill(6), names_df['name']))
-    files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
     
-    print(f"[{datetime.now()}] 启动高性能复盘引擎...")
-    # 限制并行，确保稳定
+    files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+    print(f"[{datetime.now()}] 启动虚拟账本全量回测，扫描 {len(files)} 只标的...")
+    
+    # 使用 n_jobs=2 稳定运行，防止 Actions 卡死
     results = Parallel(n_jobs=2)(delayed(analyze_stock)(f, names_dict) for f in files)
     
-    final_list = [r for r in results if r is not None]
-    if final_list:
-        res_df = pd.DataFrame(final_list).sort_values(by="历史20日胜率", ascending=False)
-        out_dir = datetime.now().strftime("%Y-%m")
+    final_hits = [r for r in results if r is not None]
+    if final_hits:
+        res_df = pd.DataFrame(final_hits).sort_values(by="历史20日胜率", ascending=False)
+        
+        # 存储路径
+        now = datetime.now()
+        out_dir = now.strftime("%Y-%m")
         os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, f"{STRATEGY_NAME}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv")
-        res_df.to_csv(path, index=False, encoding='utf-8-sig')
-        print(f"复盘完毕！今日捕获 {len(res_df)} 只潜力股，结果已更新至仓库。")
+        file_path = os.path.join(out_dir, f"{STRATEGY_NAME}_{now.strftime('%Y%m%d_%H%M')}.csv")
+        
+        res_df.to_csv(file_path, index=False, encoding='utf-8-sig')
+        print(f"复盘完成！今日发现 {len(res_df)} 只符合『缩量反包』战法且历史胜率较高的标的。")
     else:
-        print("今日暂未发现符合条件的『极度缩量反包』信号。")
+        print("今日暂未发现符合条件的信号（尝试放宽缩量条件或检查数据更新）。")
 
 if __name__ == "__main__":
     main()
