@@ -7,7 +7,7 @@ on:
       - 'stock_scanner_go_mini.py' 
       - '.github/workflows/stock_scanner_go_mini.yml'
   schedule:
-    - cron: '23 7 * * *' 
+    - cron: '23 7 * * *'  # 北京时间 15:23 运行
 
 permissions:
   contents: write
@@ -35,6 +35,8 @@ jobs:
 
       - name: 🚀 运行股票筛选脚本
         run: |
+          # 确保结果文件夹存在，防止脚本未生成文件夹时报错
+          mkdir -p results
           python stock_scanner_go_mini.py
 
       - name: 💾 自动同步并提交结果
@@ -44,24 +46,33 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git config --global core.quotepath false
           
-          # 2. 关键步骤：暂存（Stash）新生成的 CSV 文件
-          # 这样工作区就变干净了，可以安全地进行 rebase
-          git add results/**/*.csv
-          git stash
-          
-          # 3. 拉取远程更新并合并
-          git pull origin ${{ github.ref_name }} --rebase
-          
-          # 4. 释放暂存的文件
-          # pop 会将结果文件重新放回 results 文件夹
-          git stash pop || echo "No changes to pop"
-          
-          # 5. 提交并推送
-          git add results/**/*.csv
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "发现新数据，准备提交..."
-            git commit -m "🤖 自动更新极致精选结果: $(date +'%Y-%m-%d %H:%M')"
-            git push origin ${{ github.ref_name }}
+          # 2. 检查 results 目录下及其子目录是否有新的 CSV 文件生成
+          # 使用 find 命令查找，如果找到的文件数大于 0 则继续
+          if [ -n "$(find results -name "*.csv" -type f 2>/dev/null)" ]; then
+            echo "✅ 检查到新生成的报告文件，准备处理 Git 同步..."
+            
+            # 3. 暂存新文件
+            git add results/**/*.csv
+            
+            # 检查是否有文件被 add（防止只有空文件夹的情况）
+            if [ -n "$(git status --porcelain)" ]; then
+              # 4. 关键：先 Stash 避开 Rebase 冲突
+              git stash
+              
+              # 5. 拉取远程更新并合并
+              git pull origin ${{ github.ref_name }} --rebase
+              
+              # 6. 释放暂存的文件
+              git stash pop || echo "No changes to pop"
+              
+              # 7. 最终提交并推送
+              git add results/**/*.csv
+              echo "发现数据变动，准备提交..."
+              git commit -m "🤖 自动更新极致精选结果: $(date +'%Y-%m-%d %H:%M')"
+              git push origin ${{ github.ref_name }}
+            else
+              echo "文件内容与仓库已有记录完全一致，跳过提交。"
+            fi
           else
-            echo "没有发现标的变动，跳过本次提交。"
+            echo "🤔 本次扫描未发现符合条件的标的（无 CSV 生成），跳过 Git 操作。"
           fi
